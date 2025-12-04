@@ -1,22 +1,30 @@
+import streamlit as st
+import pandas as pd
 import json
 import os
-from datetime import datetime, timedelta
+import uuid
+from datetime import datetime, timedelta, time
 from dataclasses import dataclass, field, asdict
-from typing import List, Optional, Dict
+from typing import List, Optional
 
 # ==========================================
-# CONSTANTS & CONFIGURATION
+# CONFIGURATION & CONSTANTS
 # ==========================================
 
-APP_NAME = "Polymer Aviation Flight Log"
+st.set_page_config(
+    page_title="Polymer Aviation Flight Log",
+    page_icon="✈️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 DB_FILENAME = "polymer_aviation_log.json"
-
 AIRCRAFT_OPTIONS = ["N74JX", "N618KF"]
 APPROACH_TYPES = ['Vis', 'RNAV', 'ILS', 'LPV', 'Circle', 'Overlay']
 SIGNATURE_OPTIONS = ["Todd Hotes", "Andrew Waller"]
 
 # ==========================================
-# DATA MODELS
+# DATA MODELS (Equivalent to types.ts)
 # ==========================================
 
 @dataclass
@@ -43,26 +51,18 @@ class FlightSegment:
     arr_id: str
     diversion_id: str
     pax: int
-    
-    # Times
     fms_takeoff: str
     fms_landing: str
     fms_total: str
     hobbs_out: float
     hobbs_in: float
-    
-    # Crew
     pic_initials: str
     sic_initials: str
-    
-    # Stats
     landings: int
     approach_type: str
     fuel_consumed: int
     left_engine_cycles: int
     right_engine_cycles: int
-    
-    # Calculated on runtime/save
     cumulative: CumulativeTotals = field(default_factory=CumulativeTotals)
 
     @property
@@ -75,19 +75,15 @@ class VorCheck:
     flight_id: str
     date: str
     signature: str
-    
-    # VOR 1
     vor1_name: str
     vor1_freq: str
     vor1_error: int
-    
-    # VOR 2
     vor2_name: str
     vor2_freq: str
     vor2_error: int
 
 # ==========================================
-# LOGIC & MANAGER CLASS
+# LOGIC MANAGER (Equivalent to utils.ts)
 # ==========================================
 
 class FlightLogManager:
@@ -98,7 +94,7 @@ class FlightLogManager:
         self.load_data()
 
     def load_data(self):
-        """Loads data from the JSON master file if it exists."""
+        """Loads data from local JSON file."""
         if not os.path.exists(DB_FILENAME):
             return
 
@@ -118,7 +114,6 @@ class FlightLogManager:
             # Load Flights
             self.flights = []
             for f in data.get('flights', []):
-                # Reconstruct object
                 seg = FlightSegment(
                     id=f['id'], date=f['date'], aircraft_id=f['aircraftId'],
                     operated_by=f['operatedBy'], dep_id=f['depId'], arr_id=f['arrId'],
@@ -130,13 +125,17 @@ class FlightLogManager:
                     fuel_consumed=f.get('fuelConsumed', 0),
                     left_engine_cycles=f['leftEngineCycles'], right_engine_cycles=f['rightEngineCycles']
                 )
+                # Rehydrate cumulative if it exists, otherwise recalc will handle it
+                if 'cumulative' in f:
+                    c = f['cumulative']
+                    seg.cumulative = CumulativeTotals(c['hobbs'], c['landings'], c['leftEngineCycles'], c['rightEngineCycles'])
                 self.flights.append(seg)
 
             # Load VOR Checks
             self.vor_checks = []
             for v in data.get('vorChecks', []):
                 chk = VorCheck(
-                    id=v['id'], flight_id=v['flightId'], date=v['date'], signature=v['signature'],
+                    id=v['id'], flight_id=v.get('flightId', ''), date=v['date'], signature=v['signature'],
                     vor1_name=v['vor1Name'], vor1_freq=v['vor1Frequency'], vor1_error=v['vor1BearingError'],
                     vor2_name=v['vor2Name'], vor2_freq=v['vor2Frequency'], vor2_error=v['vor2BearingError']
                 )
@@ -145,17 +144,14 @@ class FlightLogManager:
             self.recalculate_logbook()
 
         except Exception as e:
-            print(f"Error loading data: {e}")
+            st.error(f"Error loading data: {e}")
 
     def save_data(self):
-        """Saves current state to JSON master file."""
+        """Saves current state to local JSON file."""
         self.recalculate_logbook()
         
-        # Serialize Objects
         flights_json = []
         for f in self.flights:
-            f_dict = asdict(f)
-            # CamelCase conversion for consistency with the React App JSON structure
             f_export = {
                 'id': f.id, 'date': f.date, 'aircraftId': f.aircraft_id,
                 'operatedBy': f.operated_by, 'depId': f.dep_id, 'arrId': f.arr_id,
@@ -179,27 +175,18 @@ class FlightLogManager:
             }
             vor_json.append(v_export)
 
-        initials_json = {
-            'hobbs': self.initial_totals.hobbs,
-            'landings': self.initial_totals.landings,
-            'leftEngineCycles': self.initial_totals.left_engine_cycles,
-            'rightEngineCycles': self.initial_totals.right_engine_cycles
-        }
-
         master_data = {
             'flights': flights_json,
             'vorChecks': vor_json,
-            'initialTotals': initials_json,
+            'initialTotals': asdict(self.initial_totals),
             'lastUpdated': datetime.now().isoformat()
         }
 
         with open(DB_FILENAME, 'w') as f:
             json.dump(master_data, f, indent=2)
-        print("Data saved successfully.")
 
     def recalculate_logbook(self):
-        """Core Logic: Sorts flights and calculates running totals starting from Initial Totals."""
-        # Sort by date
+        """Re-runs running totals from initial values."""
         self.flights.sort(key=lambda x: x.date)
 
         current_hobbs = self.initial_totals.hobbs
@@ -224,7 +211,10 @@ class FlightLogManager:
 
     def add_flight(self, flight: FlightSegment):
         self.flights.append(flight)
-        self.recalculate_logbook()
+        self.save_data()
+    
+    def delete_flight(self, flight_id: str):
+        self.flights = [f for f in self.flights if f.id != flight_id]
         self.save_data()
 
     def add_vor_check(self, check: VorCheck):
@@ -234,262 +224,376 @@ class FlightLogManager:
     def get_last_vor_check_date(self) -> Optional[str]:
         if not self.vor_checks:
             return None
-        # Sort by date descending
         sorted_checks = sorted(self.vor_checks, key=lambda x: x.date, reverse=True)
         return sorted_checks[0].date
 
     @staticmethod
-    def calculate_fms_total(start: str, end: str) -> str:
-        if not start or not end: return "00:00"
-        try:
-            fmt = "%H:%M"
-            t1 = datetime.strptime(start, fmt)
-            t2 = datetime.strptime(end, fmt)
-            if t2 < t1:
-                t2 += timedelta(days=1)
-            diff = t2 - t1
-            minutes = int(diff.total_seconds() / 60)
-            hours = minutes // 60
-            mins = minutes % 60
-            return f"{hours:02}:{mins:02}"
-        except:
-            return "00:00"
+    def calculate_fms_total(start_t: time, end_t: time) -> str:
+        # Simple crossing midnight logic not implemented for time objects in this snippet
+        # assuming same day for simplicity, or simple subtraction
+        d1 = timedelta(hours=start_t.hour, minutes=start_t.minute)
+        d2 = timedelta(hours=end_t.hour, minutes=end_t.minute)
+        
+        if d2 < d1:
+            d2 += timedelta(days=1)
+            
+        seconds = (d2 - d1).total_seconds()
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        return f"{hours:02}:{minutes:02}"
 
     @staticmethod
-    def days_between(d1: str, d2: str) -> int:
+    def days_between(d1_str: str, d2_str: str) -> int:
         try:
-            date1 = datetime.strptime(d1, "%Y-%m-%d")
-            date2 = datetime.strptime(d2, "%Y-%m-%d")
+            date1 = datetime.strptime(d1_str, "%Y-%m-%d")
+            date2 = datetime.strptime(d2_str, "%Y-%m-%d")
             return abs((date1 - date2).days)
         except:
             return 0
 
 # ==========================================
-# CLI INTERFACE
+# UI RENDERING FUNCTIONS
 # ==========================================
 
-def get_input_choice(prompt: str, options: List[str]) -> str:
-    print(f"\n{prompt}")
-    for i, opt in enumerate(options):
-        print(f"{i+1}. {opt}")
-    while True:
-        try:
-            choice = int(input("Select option: "))
-            if 1 <= choice <= len(options):
-                return options[choice-1]
-        except ValueError:
-            pass
-        print("Invalid selection.")
-
-def clear_screen():
-    os.system('cls' if os.name == 'nt' else 'clear')
-
-def main():
-    manager = FlightLogManager()
-
-    while True:
-        clear_screen()
-        print(f"=== {APP_NAME} ===")
-        print(f"Total Flights: {len(manager.flights)} | Total VOR Checks: {len(manager.vor_checks)}")
-        print("\nMain Menu:")
-        print("1. Log New Flight Segment")
-        print("2. Record VOR Check")
-        print("3. View Master Logbook (Table)")
-        print("4. View Daily Summary")
-        print("5. View VOR Check History")
-        print("6. Configure Initial Totals (Transfer In)")
-        print("7. Exit")
-
-        choice = input("\nSelect an option: ")
-
-        if choice == '1':
-            log_flight(manager)
-        elif choice == '2':
-            log_vor(manager)
-        elif choice == '3':
-            view_logbook(manager)
-        elif choice == '4':
-            view_daily_summary(manager)
-        elif choice == '5':
-            view_vor_history(manager)
-        elif choice == '6':
-            configure_initials(manager)
-        elif choice == '7':
-            print("Goodbye.")
-            break
-        else:
-            input("Invalid option. Press Enter to continue...")
-
-def log_flight(manager: FlightLogManager):
-    clear_screen()
-    print("--- Log New Flight Segment ---")
+def render_sidebar(manager: FlightLogManager):
+    st.sidebar.title("Polymer Aviation")
+    st.sidebar.caption("Digital Flight Logbook")
     
-    date = input(f"Date [{datetime.now().strftime('%Y-%m-%d')}]: ") or datetime.now().strftime('%Y-%m-%d')
-    aircraft = get_input_choice("Select Aircraft:", AIRCRAFT_OPTIONS)
-    operator = input("Operated By: ")
-    dep = input("Departure (ICAO): ").upper()
-    arr = input("Arrival (ICAO): ").upper()
-    div = input("Diversion (Optional): ").upper()
-    pax = int(input("PAX Count: ") or 0)
-    
-    print("\n--- Times ---")
-    fms_out = input("FMS Takeoff (HH:MM): ")
-    fms_in = input("FMS Landing (HH:MM): ")
-    fms_total = manager.calculate_fms_total(fms_out, fms_in)
-    
-    hobbs_out = float(input("Hobbs Out: "))
-    hobbs_in = float(input("Hobbs In: "))
-    
-    print("\n--- Crew & Stats ---")
-    pic = input("PIC Initials: ").upper()
-    sic = input("SIC Initials: ").upper()
-    landings = int(input("Landings: ") or 1)
-    appr = get_input_choice("Approach Type:", APPROACH_TYPES)
-    
-    l_cycles = int(input("Left Engine Cycles (This Leg): ") or 1)
-    r_cycles = int(input("Right Engine Cycles (This Leg): ") or 1)
-    
-    print("\n--- Fuel ---")
-    fuel = int(input("Fuel Consumed (lbs): ") or 0)
-
-    import uuid
-    new_id = str(uuid.uuid4())[:8]
-
-    seg = FlightSegment(
-        id=new_id, date=date, aircraft_id=aircraft, operated_by=operator,
-        dep_id=dep, arr_id=arr, diversion_id=div, pax=pax,
-        fms_takeoff=fms_out, fms_landing=fms_in, fms_total=fms_total,
-        hobbs_out=hobbs_out, hobbs_in=hobbs_in,
-        pic_initials=pic, sic_initials=sic,
-        landings=landings, approach_type=appr, fuel_consumed=fuel,
-        left_engine_cycles=l_cycles, right_engine_cycles=r_cycles
+    option = st.sidebar.radio(
+        "Navigation", 
+        ["Log New Flight", "Record VOR Check", "View Logbook", "Daily Summary", "Settings", "AI Assistant"],
+        index=0
     )
-
-    manager.add_flight(seg)
-    print("Flight Logged Successfully.")
     
-    # Optional VOR Check associated with flight
-    if input("Record VOR Check for this flight? (y/n): ").lower() == 'y':
-        log_vor(manager, flight_id=new_id, date=date)
+    st.sidebar.divider()
+    
+    # Download JSON
+    if os.path.exists(DB_FILENAME):
+        with open(DB_FILENAME, "rb") as f:
+            st.sidebar.download_button(
+                "Download Master File",
+                f,
+                file_name="polymer_aviation_log.json",
+                mime="application/json"
+            )
+    return option
+
+def render_dashboard_widgets(manager: FlightLogManager):
+    # Calculate current totals (Initial + All Flights)
+    if manager.flights:
+        last = manager.flights[-1].cumulative
+        curr_hobbs = last.hobbs
+        curr_lnd = last.landings
+        curr_lc = last.left_engine_cycles
+        curr_rc = last.right_engine_cycles
     else:
-        input("Press Enter to continue...")
+        init = manager.initial_totals
+        curr_hobbs = init.hobbs
+        curr_lnd = init.landings
+        curr_lc = init.left_engine_cycles
+        curr_rc = init.right_engine_cycles
 
-def log_vor(manager: FlightLogManager, flight_id=None, date=None):
-    clear_screen()
-    print("--- Record Dual VOR Check ---")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Hobbs", f"{curr_hobbs:.1f}", "hrs")
+    c2.metric("Total Landings", curr_lnd)
+    c3.metric("Left Eng. Cycles", curr_lc)
+    c4.metric("Right Eng. Cycles", curr_rc)
+    st.divider()
+
+def render_log_flight_form(manager: FlightLogManager):
+    st.header("✈️ Log New Flight Segment")
     
-    if not date:
-        date = input(f"Date [{datetime.now().strftime('%Y-%m-%d')}]: ") or datetime.now().strftime('%Y-%m-%d')
+    render_dashboard_widgets(manager)
+
+    with st.form("flight_input_form"):
+        # Row 1
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: date_input = st.date_input("Date")
+        with c2: aircraft = st.selectbox("Aircraft", AIRCRAFT_OPTIONS)
+        with c3: operated_by = st.text_input("Operated By", "Polymer Aviation")
+        with c4: pax = st.number_input("PAX", min_value=0, step=1)
+        
+        # Row 2
+        st.subheader("Route & Crew")
+        r1, r2, r3, r4, r5 = st.columns(5)
+        with r1: dep = st.text_input("Dep (ICAO)").upper()
+        with r2: arr = st.text_input("Arr (ICAO)").upper()
+        with r3: div = st.text_input("Alt (ICAO)").upper()
+        with r4: pic = st.text_input("PIC Initials").upper()
+        with r5: sic = st.text_input("SIC Initials").upper()
+        
+        # Row 3
+        st.subheader("Times & Fuel")
+        t1, t2, t3, t4, t5 = st.columns(5)
+        with t1: fms_out = st.time_input("FMS Takeoff", time(12,0))
+        with t2: fms_in = st.time_input("FMS Landing", time(13,0))
+        with t3: hobbs_out = st.number_input("Hobbs Out", format="%.1f")
+        with t4: hobbs_in = st.number_input("Hobbs In", format="%.1f")
+        with t5: 
+            # Datalist simulation
+            fuel_opts = [x*100 for x in range(4, 41)] # 400 to 4000
+            fuel = st.selectbox("Fuel Consumed (lbs)", fuel_opts, index=4) # Default 800
+
+        # Row 4
+        st.subheader("Stats")
+        s1, s2, s3, s4 = st.columns(4)
+        with s1: landings = st.number_input("Landings", min_value=1, value=1)
+        with s2: approach = st.selectbox("Approach", APPROACH_TYPES)
+        with s3: l_cyc = st.number_input("Left Eng Cycles (+)", min_value=0, value=1)
+        with s4: r_cyc = st.number_input("Right Eng Cycles (+)", min_value=0, value=1)
+        
+        submit = st.form_submit_button("Save Flight Log", type="primary")
+
+        if submit:
+            fms_total = manager.calculate_fms_total(fms_out, fms_in)
+            new_id = str(uuid.uuid4())[:8]
+            
+            flight = FlightSegment(
+                id=new_id,
+                date=date_input.strftime("%Y-%m-%d"),
+                aircraft_id=aircraft,
+                operated_by=operated_by,
+                dep_id=dep, arr_id=arr, diversion_id=div, pax=pax,
+                fms_takeoff=fms_out.strftime("%H:%M"),
+                fms_landing=fms_in.strftime("%H:%M"),
+                fms_total=fms_total,
+                hobbs_out=hobbs_out, hobbs_in=hobbs_in,
+                pic_initials=pic, sic_initials=sic,
+                landings=landings, approach_type=approach,
+                fuel_consumed=fuel,
+                left_engine_cycles=l_cyc, right_engine_cycles=r_cyc
+            )
+            
+            manager.add_flight(flight)
+            st.success("Flight recorded successfully!")
+            st.rerun()
+
+def render_vor_form(manager: FlightLogManager):
+    st.header("📡 Record Dual VOR Check")
     
-    # Check 30 day logic
+    # 30-Day Check Logic
     last_date = manager.get_last_vor_check_date()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    
     if last_date:
-        days = manager.days_between(date, last_date)
-        print(f"Previous Check: {last_date} ({days} days ago)")
+        days = manager.days_between(today_str, last_date)
         if days > 30:
-            print("!!! WARNING: VOR CHECK EXPIRED (>30 Days) !!!")
+            st.warning(f"⚠️ **Check Expired!** Last check was {last_date} ({days} days ago).")
         else:
-            print("Status: Current")
-    
-    print("\n--- VOR 1 ---")
-    v1_name = input("VOR 1 Identifier: ").upper()
-    v1_freq = input("VOR 1 Freq: ")
-    v1_err = int(input("VOR 1 Bearing Error: "))
-    
-    print("\n--- VOR 2 ---")
-    v2_name = input("VOR 2 Identifier: ").upper()
-    v2_freq = input("VOR 2 Freq: ")
-    v2_err = int(input("VOR 2 Bearing Error: "))
-    
-    sig = get_input_choice("Signature:", SIGNATURE_OPTIONS)
+            st.success(f"✅ **Current.** Last check was {last_date} ({days} days ago).")
+    else:
+        st.info("No previous VOR checks found.")
+        
+    with st.form("vor_input_form"):
+        date_val = st.date_input("Check Date")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("### VOR #1")
+            v1n = st.text_input("VOR 1 ID").upper()
+            v1f = st.text_input("VOR 1 Freq")
+            v1e = st.number_input("VOR 1 Error", min_value=-10, max_value=10, value=0)
+        with c2:
+            st.markdown("### VOR #2")
+            v2n = st.text_input("VOR 2 ID").upper()
+            v2f = st.text_input("VOR 2 Freq")
+            v2e = st.number_input("VOR 2 Error", min_value=-10, max_value=10, value=0)
+            
+        st.divider()
+        sig = st.selectbox("Signature", SIGNATURE_OPTIONS)
+        
+        submitted = st.form_submit_button("Record VOR Check")
+        if submitted:
+            chk = VorCheck(
+                id=str(uuid.uuid4())[:8],
+                flight_id="",
+                date=date_val.strftime("%Y-%m-%d"),
+                signature=sig,
+                vor1_name=v1n, vor1_freq=v1f, vor1_error=v1e,
+                vor2_name=v2n, vor2_freq=v2f, vor2_error=v2e
+            )
+            manager.add_vor_check(chk)
+            st.success("VOR Check Recorded.")
+            st.rerun()
 
-    import uuid
-    chk = VorCheck(
-        id=str(uuid.uuid4())[:8],
-        flight_id=flight_id if flight_id else "",
-        date=date,
-        signature=sig,
-        vor1_name=v1_name, vor1_freq=v1_freq, vor1_error=v1_err,
-        vor2_name=v2_name, vor2_freq=v2_freq, vor2_error=v2_err
-    )
-    
-    manager.add_vor_check(chk)
-    print("VOR Check Recorded.")
-    input("Press Enter to continue...")
+    # VOR History Table
+    st.subheader("History")
+    if manager.vor_checks:
+        checks_data = []
+        for c in sorted(manager.vor_checks, key=lambda x:x.date, reverse=True):
+            checks_data.append({
+                "Date": c.date,
+                "VOR 1": f"{c.vor1_name} ({c.vor1_freq})",
+                "Err 1": c.vor1_error,
+                "VOR 2": f"{c.vor2_name} ({c.vor2_freq})",
+                "Err 2": c.vor2_error,
+                "Signature": c.signature
+            })
+        st.dataframe(pd.DataFrame(checks_data), use_container_width=True, hide_index=True)
 
-def view_logbook(manager: FlightLogManager):
-    clear_screen()
-    flights = manager.flights[::-1] # Show newest first
+def render_logbook_view(manager: FlightLogManager):
+    st.header("📖 Master Flight Log")
     
-    print(f"{'Date':<12} {'Aircraft':<10} {'Route':<15} {'Hobbs':<8} {'Tot Hobbs':<10} {'Lndg':<5} {'Tot Lndg':<10} {'Fuel':<6}")
-    print("-" * 90)
-    
-    for f in flights:
-        route = f"{f.dep_id}>{f.arr_id}"
-        seg_time = f.segment_duration
-        print(f"{f.date:<12} {f.aircraft_id:<10} {route:<15} {seg_time:<8.1f} {f.cumulative.hobbs:<10.1f} {f.landings:<5} {f.cumulative.landings:<10} {f.fuel_consumed:<6}")
-    
-    input("\nPress Enter to return...")
+    if not manager.flights:
+        st.info("No flights logged yet.")
+        return
 
-def view_daily_summary(manager: FlightLogManager):
-    clear_screen()
-    date_str = input(f"Enter Date to View (YYYY-MM-DD): ")
+    # Create DataFrame for display
+    # Showing newest first
+    data = []
+    for f in reversed(manager.flights):
+        data.append({
+            "Date": f.date,
+            "Aircraft": f.aircraft_id,
+            "Route": f"{f.dep_id} > {f.arr_id}",
+            "Seg Hobbs": f"{f.segment_duration:.1f}",
+            "Tot Hobbs": f"{f.cumulative.hobbs:.1f}",
+            "Seg Lndg": f.landings,
+            "Tot Lndg": f.cumulative.landings,
+            "Fuel": f.fuel_consumed,
+            "L/R Cyc": f"{f.left_engine_cycles}/{f.right_engine_cycles}",
+            "Tot Cyc": f"{f.cumulative.left_engine_cycles}/{f.cumulative.right_engine_cycles}",
+            "ID": f.id # Hidden column reference
+        })
     
+    df = pd.DataFrame(data)
+    st.dataframe(df.drop(columns=["ID"]), use_container_width=True, hide_index=True)
+    
+    # Simple Delete Functionality
+    with st.expander("Manage Entries"):
+        del_id = st.selectbox("Select Flight to Delete (by Date/Route)", 
+                              options=[f.id for f in reversed(manager.flights)],
+                              format_func=lambda x: next((f"{f.date}: {f.dep_id}>{f.arr_id}" for f in manager.flights if f.id == x), x))
+        if st.button("Delete Selected Flight"):
+            manager.delete_flight(del_id)
+            st.success("Deleted.")
+            st.rerun()
+
+def render_daily_summary(manager: FlightLogManager):
+    st.header("📅 Daily Summary")
+    
+    date_sel = st.date_input("Select Date")
+    date_str = date_sel.strftime("%Y-%m-%d")
+    
+    # Filter
     day_flights = [f for f in manager.flights if f.date == date_str]
     
     if not day_flights:
-        print("No flights found for this date.")
-    else:
-        total_time = sum(f.segment_duration for f in day_flights)
-        total_lndg = sum(f.landings for f in day_flights)
-        total_fuel = sum(f.fuel_consumed for f in day_flights)
-        total_l_cyc = sum(f.left_engine_cycles for f in day_flights)
-        total_r_cyc = sum(f.right_engine_cycles for f in day_flights)
-        aircrafts = ", ".join(set(f.aircraft_id for f in day_flights))
-        
-        print(f"\n=== Daily Summary: {date_str} ===")
-        print(f"Aircraft Flown: {aircrafts}")
-        print(f"Total Flight Time: {total_time:.1f} hrs")
-        print(f"Total Landings:    {total_lndg}")
-        print(f"Total Fuel:        {total_fuel} lbs")
-        print(f"Total Cycles (L/R):{total_l_cyc} / {total_r_cyc}")
-        
-    input("\nPress Enter to return...")
+        st.info(f"No flights recorded for {date_str}.")
+        return
+    
+    # Calculate Daily Totals
+    t_hobbs = sum(f.segment_duration for f in day_flights)
+    t_land = sum(f.landings for f in day_flights)
+    t_fuel = sum(f.fuel_consumed for f in day_flights)
+    t_lc = sum(f.left_engine_cycles for f in day_flights)
+    t_rc = sum(f.right_engine_cycles for f in day_flights)
+    ac = list(set(f.aircraft_id for f in day_flights))
+    
+    # Print-friendly layout
+    st.markdown("---")
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        st.markdown(f"## Polymer Aviation Daily Log")
+        st.markdown(f"**Aircraft Flown:** {', '.join(ac)}")
+    with c2:
+        st.markdown(f"**Date:** {date_str}")
+    
+    st.markdown("### Totals")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Flight Time", f"{t_hobbs:.1f}")
+    m2.metric("Landings", t_land)
+    m3.metric("Fuel (lbs)", t_fuel)
+    m4.metric("Cycles (L/R)", f"{t_lc} / {t_rc}")
+    
+    st.markdown("### Segments")
+    seg_data = [{
+        "Route": f"{f.dep_id} > {f.arr_id}",
+        "Aircraft": f.aircraft_id,
+        "Time": f.segment_duration,
+        "PIC": f.pic_initials
+    } for f in day_flights]
+    st.table(pd.DataFrame(seg_data))
 
-def view_vor_history(manager: FlightLogManager):
-    clear_screen()
-    checks = sorted(manager.vor_checks, key=lambda x: x.date, reverse=True)
+def render_settings(manager: FlightLogManager):
+    st.header("⚙️ Settings: Initial Totals")
+    st.info("Enter the totals transferred from your previous logbook. Cumulative totals will start from here.")
     
-    print(f"{'Date':<12} {'VOR 1':<15} {'Err 1':<6} {'VOR 2':<15} {'Err 2':<6} {'Signature':<15}")
-    print("-" * 80)
-    
-    for c in checks:
-        v1 = f"{c.vor1_name} ({c.vor1_freq})"
-        v2 = f"{c.vor2_name} ({c.vor2_freq})"
-        print(f"{c.date:<12} {v1:<15} {c.vor1_error:<6} {v2:<15} {c.vor2_error:<6} {c.signature:<15}")
-
-    input("\nPress Enter to return...")
-
-def configure_initials(manager: FlightLogManager):
-    clear_screen()
-    print("--- Transfer In / Initial Totals ---")
-    print("Current Initials:")
-    print(manager.initial_totals)
-    print("\nEnter new starting values:")
-    
-    try:
-        h = float(input("Total Hobbs: "))
-        l = int(input("Total Landings: "))
-        lc = int(input("Left Engine Cycles: "))
-        rc = int(input("Right Engine Cycles: "))
+    with st.form("settings_form"):
+        i = manager.initial_totals
+        nh = st.number_input("Total Hobbs", value=i.hobbs, format="%.1f")
+        nl = st.number_input("Total Landings", value=i.landings)
+        nlc = st.number_input("Left Engine Cycles", value=i.left_engine_cycles)
+        nrc = st.number_input("Right Engine Cycles", value=i.right_engine_cycles)
         
-        manager.initial_totals = InitialTotals(h, l, lc, rc)
-        manager.save_data() # This triggers recalculation
-        print("Totals updated and logbook recalculated.")
-    except ValueError:
-        print("Invalid input. No changes made.")
+        if st.form_submit_button("Update Initial Totals"):
+            manager.initial_totals = InitialTotals(nh, nl, nlc, nrc)
+            manager.save_data()
+            st.success("Totals updated.")
+            st.rerun()
+
+def render_ai_assistant(manager: FlightLogManager):
+    st.header("✨ AI Assistant (Gemini)")
     
-    input("Press Enter to continue...")
+    api_key = st.text_input("Enter Google Gemini API Key", type="password")
+    
+    if not api_key:
+        st.warning("Please enter an API Key to use the assistant.")
+        return
+
+    import google.generativeai as genai
+    genai.configure(api_key=api_key)
+    
+    query = st.text_input("Ask about your logbook (e.g., 'How many ILS approaches last month?')")
+    
+    if st.button("Ask Gemini") and query:
+        with st.spinner("Analyzing logbook..."):
+            try:
+                # Prepare context
+                context = {
+                    "flights": [asdict(f) for f in manager.flights],
+                    "vor_checks": [asdict(v) for v in manager.vor_checks]
+                }
+                
+                model = genai.GenerativeModel('gemini-1.5-flash')
+                prompt = f"""
+                You are an aviation logbook assistant. Here is the flight data JSON:
+                {json.dumps(context, default=str)}
+                
+                User Question: {query}
+                
+                Provide a helpful, aviation-professional answer based strictly on the data provided.
+                """
+                
+                response = model.generate_content(prompt)
+                st.markdown(response.text)
+            except Exception as e:
+                st.error(f"AI Error: {e}")
+
+# ==========================================
+# MAIN APP EXECUTION
+# ==========================================
+
+def main():
+    # Initialize Logic
+    manager = FlightLogManager()
+    
+    # Sidebar
+    choice = render_sidebar(manager)
+    
+    # Routing
+    if choice == "Log New Flight":
+        render_log_flight_form(manager)
+    elif choice == "Record VOR Check":
+        render_vor_form(manager)
+    elif choice == "View Logbook":
+        render_logbook_view(manager)
+    elif choice == "Daily Summary":
+        render_daily_summary(manager)
+    elif choice == "Settings":
+        render_settings(manager)
+    elif choice == "AI Assistant":
+        render_ai_assistant(manager)
 
 if __name__ == "__main__":
     main()
